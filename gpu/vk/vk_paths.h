@@ -4,6 +4,12 @@
 // beside image.bin.
 #pragma once
 #include <cstring>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN   // ((local) no rpcndr.h: its "small" macro broke vk_menu.cpp)
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX   // ((local) std::min/std::max in the files that include this first)
+#endif
 #include <windows.h>
 
 namespace mkwvk {
