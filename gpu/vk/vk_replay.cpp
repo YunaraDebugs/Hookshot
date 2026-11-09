@@ -680,6 +680,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         case NOP_SIGNAL_EVENT: {
             if (!worker) {   // (in stream order: the replay thread's pass)
                 const auto e = payload<nvn_p_signal>(a, avail);
+                memory_note_event(e.gpu);
                 ev_cpu_apply();
                 auto it = ev_values.find(e.gpu);
                 uint32_t old = it != ev_values.end() ? it->second : 0;
@@ -2134,6 +2135,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
                 }
                 w = true;
             }
+            memory_rb_merge(completed());   // ((local) the readback pages' words the GPU changed, before the CPU reads: RbJob)
             if (w) {
                 waited++;
                 const int64_t d = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count();

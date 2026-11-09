@@ -823,7 +823,9 @@ static int present_poll(Ctx *c, int64_t ns) {
 }
 HLE(_ZN2nn2os11SleepThreadENS_8TimeSpanE) {
     if (present_poll(c, (int64_t)ARG(0))) return;
-    if (c->x[30] == 0x80590520 && getenv("HOS_SLEEP_LOG")) {   /* (hookshot, diagnostic: OoT's present poll) */
+    static int sleep_log = -1;   /* ((local) read once) */
+    if (sleep_log < 0) sleep_log = getenv("HOS_SLEEP_LOG") != NULL;
+    if (c->x[30] == 0x80590520 && sleep_log) {   /* (hookshot, diagnostic: OoT's present poll) */
         static int logged;
         if (logged++ < 3) {
             const char *hos_hostcall_name(uint64_t addr);

@@ -82,7 +82,8 @@ struct BufferRef {
     }
 };
 bool memory_init();                                   // vk_memory.cpp
-void memory_cpu_owned(uint64_t guest, uint64_t size);   // (hookshot: words the replay writes on the CPU, left out of write-backs)
+void memory_cpu_owned(uint64_t guest, uint64_t size);
+void memory_note_event(uint64_t guest);   // ((local) a page the replay signals NVN events in: no capture waits for it, not captured)   // (hookshot: words the replay writes on the CPU, left out of write-backs)
 void memory_table_begin();                         // (hookshot: a recording's page table changes held back for its upload commands)
 bool memory_table_flush();
 uint64_t memory_guest_pages();                        // (hookshot: the device address of guest memory's page table, 0: none)
@@ -180,6 +181,7 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
 bool memory_rb_refresh(VkCommandBuffer up);
+void memory_rb_merge(uint64_t completed);   // ((local) the readback pages' write-backs of finished submissions, merged into guest memory)
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
 void vk_timeline_wait(uint64_t v);

@@ -5286,6 +5286,9 @@ bool taau_key(uint64_t key) {
     static const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS")
                               : Shader::Backend::SPIRV::mma_software || getenv("RX_VK_NO_F16")
                                     ? "fd029a317a9a4b94" : "-";   // (RX_VK_NO_F16: vk_shader.cpp leaves the network out)
+    // ((local) the answer kept per program key and thread: this runs on every dispatch, and the key never changes its answer)
+    thread_local std::unordered_map<uint64_t, bool> known;
+    if (auto it = known.find(key); it != known.end()) return it->second;
     char hex[24];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
     bool match = false;
@@ -5295,6 +5298,7 @@ bool taau_key(uint64_t key) {
         match = e > q && *q != '-' && !strncmp(hex, q, (size_t)(e - q));
         q = *e ? e + 1 : e;
     }
+    if (known.size() < 4096) known.emplace(key, match);
     return match;
 }
 static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageView output_view,
@@ -5417,7 +5421,8 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
     return true;
 }
 bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
-    const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
+    // ((local) read once: a getenv on every dispatch was 1.5% of the replay thread in Kokiri)
+    static const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
     if (!taau_key(p.key) || !dev.push_descriptor || !vkCmdPushDescriptorSetKHR || p.stages.empty()) return false;
     const Stage& st = p.stages[0];
     if (st.info.texture_descriptors.empty() || st.info.image_descriptors.empty()) return false;
