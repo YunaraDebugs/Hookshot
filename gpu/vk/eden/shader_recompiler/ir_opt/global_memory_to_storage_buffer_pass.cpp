@@ -1294,6 +1294,49 @@ bool MixesLoadedPointer(const IR::Value& value) {
     return merge && loaded;
 }
 
+/// ((local) RX_VK_MESH_PTR) Whether an address is built on a 64-bit pointer loaded from memory (its low word summed in).
+/// Ocarina's plant mesh programs read their vertex records at *(sb1 + 16) + index * stride, the index made from c5 words: the
+/// searches below took one of those words (c5+0x60, +0x1d0, +0x228: a texture handle and a float) for the base, the access read
+/// zeros or another buffer. (It did not fix the neon stems and flowers, #905 did; kept as an experiment, off unless RX_VK_MESH_PTR=1.)
+bool BuiltOnLoadedPointer(const IR::Value& value) {
+    if (value.IsImmediate()) {
+        return false;
+    }
+    std::vector<const IR::Inst*> todo{value.InstRecursive()};
+    std::unordered_set<const IR::Inst*> seen;
+    while (!todo.empty() && seen.size() < 256) {
+        const IR::Inst* const inst{todo.back()};
+        todo.pop_back();
+        if (!seen.insert(inst).second) {
+            continue;
+        }
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::LoadStorage64:
+        case IR::Opcode::LoadGlobal64:
+            return true;
+        case IR::Opcode::LoadStorage32:
+        case IR::Opcode::LoadStorage128:
+        case IR::Opcode::LoadGlobal32:
+        case IR::Opcode::LoadGlobal128:
+            continue;   // (a loaded index or record, not a pointer; what it loads from is another matter)
+        default:
+            break;
+        }
+        for (size_t i = 0; i < inst->NumArgs(); ++i) {
+            const IR::Value arg{inst->Arg(i)};
+            if (!arg.IsImmediate()) {
+                todo.push_back(arg.InstRecursive());
+            }
+        }
+    }
+    return false;
+}
+bool MeshPtrOn() {
+    static const bool on{std::getenv("RX_VK_MESH_PTR") && std::atoi(std::getenv("RX_VK_MESH_PTR")) != 0};   // (off unless =1)
+    return on;
+}
+thread_local bool g_mesh_ptr_stage = false;   // ((local) a task or mesh program, with RX_VK_MESH_PTR on)
+
 thread_local bool g_follow_stage = false;   // (hookshot: the program being translated is compute, where the page table is)
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
@@ -1453,6 +1496,12 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     // First try to find storage buffers in the NVN address
     if (!storage_buffer) {
         storage_buffer = cached_track(bias, info.biased_tracks);
+    }
+    if (!storage_buffer && g_mesh_ptr_stage && !IsGlobalMemoryWrite(inst) && BuiltOnLoadedPointer(low_addr)) {
+        // ((local) RX_VK_MESH_PTR) not in an NVN slot and built on a loaded pointer: left global, read through the page table
+        // (the task and mesh stages have it with this switch), not bound to whatever constant word the unbiased search meets
+        leave_global();
+        return;
     }
     if (!storage_buffer) {
         // If it fails, track without a bias
@@ -1626,6 +1675,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     // (hookshot)
     static const bool no_mesh{std::getenv("RX_VK_FOLLOW_MESH") == nullptr};
     g_follow_stage = program.stage == Stage::Compute || (!no_mesh && (program.stage == Stage::Task || program.stage == Stage::Mesh));
+    g_mesh_ptr_stage = MeshPtrOn() && (program.stage == Stage::Task || program.stage == Stage::Mesh);
     g_origins.clear();   // (EvilOOT: Origins' walk, kept per program)
     const bool pairing{!GmLegacy()};
     std::optional<TrackingConditions> conditions;

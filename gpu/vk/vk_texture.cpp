@@ -476,6 +476,29 @@ void bc_encode_resized(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t ow,
 void bc_encode_into(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t n, Texture& dst, uint32_t level,
                     uint32_t layer, int dx, int dy, VkImageView from = VK_NULL_HANDLE) {
     full_barrier(cmd);
+    {   // ((local) A level whose size is not a multiple of 4 (a 1000-wide texture's 125, 31...) ends in partial blocks: the encoder
+        // read the scratch past the level's edge, what an earlier, larger level or texture left there, and those texels pulled the
+        // block's colours off: a dark rim along the texture's edges in those levels. Hyrule Field's ground repeats its textures
+        // once a tile, and from a distance, where those levels are sampled, its tiles were outlined in dark lines. The edge
+        // column and row are copied into the padding first, as encoders clamp. RX_VK_BC_NO_EDGE=1: as before)
+        static const bool no_edge = getenv("RX_VK_BC_NO_EDGE") != nullptr;
+        const uint32_t pw = std::min(kBcDim, (w + 3) & ~3u), ph = std::min(kBcDim, (h + 3) & ~3u);
+        if (!no_edge && (pw > w || ph > h)) {
+            VkImageCopy c[8];
+            uint32_t k = 0;
+            for (uint32_t x = w; x < pw; x++)   // (the last column, whole height)
+                c[k++] = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n}, {(int32_t)w - 1, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n},
+                          {(int32_t)x, 0, 0}, {1, h, 1}};
+            if (k) vkCmdCopyImage(cmd, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, k, c);
+            if (k && ph > h) full_barrier(cmd);   // (the rows below copy the padded columns too)
+            k = 0;
+            for (uint32_t y = h; y < ph; y++)   // (the last row, padding included)
+                c[k++] = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n}, {0, (int32_t)h - 1, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n},
+                          {0, (int32_t)y, 0}, {pw, 1, 1}};
+            if (k) vkCmdCopyImage(cmd, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, k, c);
+            full_barrier(cmd);
+        }
+    }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_pipe);
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, from ? from : bc_scratch_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo bi{bc_out, 0, VK_WHOLE_SIZE};
@@ -698,9 +721,20 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 4);
     if (tex.bc) {   // (decoded into the scratch a run of consecutive layers at a time, re-encoded, copied in)
         if (!bc_scratch_layout(cmd, tex.bc_resized)) return false;
+        static const bool log_bc = getenv("RX_VK_LOG_BC") != nullptr;   // ((local) diagnostics: each BC3 texture's levels, 60)
+        static int bc_logged;
+        char bcline[600];
+        int bn = 0;
+        if (log_bc && bc_logged < 60)
+            bn = snprintf(bcline, sizeof bcline, "vk: bc3 #%u %ux%u x%u levels %u block %ux%u layers %zu:", tex.id, tex.width, tex.height,
+                          tex.layers, tex.levels, (unsigned)tex.block_w, (unsigned)tex.block_h, layers.size());
         for (uint32_t level = 0; level < tex.levels; level++) {
             const LevelGeo g = level_geo(tex, level);
             const uint64_t off = g.offset - tail0;
+            if (bn && bn < 560)
+                bn += snprintf(bcline + bn, sizeof bcline - bn, " L%u %ux%u%s", level, std::max(1u, tex.width >> level),
+                               std::max(1u, tex.height >> level),
+                               g.offset < tail0 ? "(before)" : off >= tail ? "(past)" : (off % align) ? "(UNALIGNED, skipped)" : "");
             if (g.offset < tail0 || off >= tail || (off % align)) continue;
             const uint32_t iw = std::max(1u, tex.width >> level), ih = std::max(1u, tex.height >> level);
             // (hookshot-amd: a resized BC3 image: the level decodes at the game's size, g.w x g.h, and is encoded at iw x ih)
@@ -715,7 +749,12 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             pc.native_tiling = 1;
             for (size_t k0 = 0; k0 < layers.size();) {
                 size_t k1 = k0 + 1;
-                while (k1 < layers.size() && k1 - k0 < kBcLayers && layers[k1] == layers[k1 - 1] + 1) k1++;
+                // ((local) one layer a run: with runs of up to kBcLayers, the arrays' layers past the run's first came out wrong in
+                // the smaller levels (the encoder's output for them is not where the copy takes it from), and Hyrule Field's
+                // ground, which samples the terrain's material arrays (1365 x 1365 x 90, ASTC 8x8), had its tiles outlined in
+                // dark lines from a distance (RX 6600: none with one layer a run, or as RGBA8). RX_VK_BC_LAYERS=<n>: n a run)
+                static const uint32_t run = getenv("RX_VK_BC_LAYERS") ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_LAYERS")), 1u, kBcLayers) : 1u;
+                while (k1 < layers.size() && k1 - k0 < run && layers[k1] == layers[k1 - 1] + 1) k1++;
                 const uint32_t n = (uint32_t)(k1 - k0);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
                 const uint64_t from = k0 * tail + off;
@@ -736,6 +775,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
                 k0 = k1;
             }
         }
+        if (bn) bc_logged++, logf("%s", bcline);
         st_astc++;
         return true;
     }
@@ -1544,7 +1584,8 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                     logf("vk: texture %#llx %ux%u x%u, %u levels: uneven BC block levels on AMD, kept as RGBA8 (%d so far)",
                          (unsigned long long)t->gpu, x.width, x.height, x.layers, x.levels, n_rgba8);
             }
-        } else if (bc_candidate && bc_ready()) {
+        } else if (bc_candidate && bc_ready() &&
+                   !(x.layers > 1 && getenv("RX_VK_BC_NO_ARRAYS"))) {   // ((local) =1: arrays as RGBA8)
             x.bc = true;
             x.format = VK_FORMAT_BC3_UNORM_BLOCK;
         }

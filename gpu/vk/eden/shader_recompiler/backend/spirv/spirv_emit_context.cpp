@@ -528,7 +528,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
         // (hookshot) the draw's first task workgroup, read through a pushed address (EmitIsbeRead)
         if (!Sirit::ValidId(U64)) { AddCapability(spv::Capability::Int64); U64 = Name(TypeInt(64, false), "u64"); }
         wants_mesh_first = true;
-        if (getenv("RX_VK_FOLLOW_MESH") && !getenv("RX_VK_NO_FOLLOW") && program.info.uses_global_memory) {
+        if ((getenv("RX_VK_FOLLOW_MESH") || (getenv("RX_VK_MESH_PTR") && atoi(getenv("RX_VK_MESH_PTR")) != 0)) && !getenv("RX_VK_NO_FOLLOW") && program.info.uses_global_memory) {
             wants_guest_pages = true;   // (the block is made once: with the page table's member if the stage will want it)
         }
         AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
@@ -1049,7 +1049,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // (the culling; a graphics stage with it hung the renderer at a load. RX_VK_NO_FOLLOW: none of it, as before)
     static const bool no_follow{getenv("RX_VK_NO_FOLLOW") != nullptr};
     // (RX_VK_FOLLOW_MESH=1: the task and mesh stages too. Tried for the foliage, which it did not bring back: off)
-    static const bool no_mesh{getenv("RX_VK_FOLLOW_MESH") == nullptr};
+    // ((local) RX_VK_MESH_PTR=1 (off by default: with it the RX 6600 hung in Kokiri on mesh 918adef1afaa39d4, and the neon was #905): the task and mesh stages too, for the accesses the pointer pass leaves global there:
+    // the plant mesh programs' vertex records, read through a pointer loaded from memory; without the table they read zeros)
+    static const bool mesh_ptr{getenv("RX_VK_MESH_PTR") && atoi(getenv("RX_VK_MESH_PTR")) != 0};
+    static const bool no_mesh{getenv("RX_VK_FOLLOW_MESH") == nullptr && !mesh_ptr};
     // (EvilOOT: vertex and fragment stages too, as the fallback only: an access no bound buffer holds read 0 there (Kokiri's
     // pond came out grey, not green). The pointer pass leaves graphics stages as they were, so what was found before still is,
     // and the menus' text stays. Not where the stage has the render area's push block: a stage has one push block.

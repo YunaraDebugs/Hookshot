@@ -1331,6 +1331,11 @@ VkSampler sampler_for(int id, bool compare) {
     // (no mipmap filter: the base level only, as NVN samples it)
     ci.maxLod = (p.minf == NVN_MIN_FILTER_NEAREST || p.minf == NVN_MIN_FILTER_LINEAR) ? ci.minLod + 0.25f
                                                                                        : std::max(ci.minLod, p.lod_max);
+    {   // ((local, experiment) RX_VK_MAX_LOD=<lod>: no sampler reads past that mip level (0: the full-size level only), to
+        // tell texture mips apart from geometry in distance-only artifacts (Hyrule Field's grid lines)
+        static const float max_lod = getenv("RX_VK_MAX_LOD") ? (float)atof(getenv("RX_VK_MAX_LOD")) : -1.0f;
+        if (max_lod >= 0.0f) ci.maxLod = std::min(ci.maxLod, std::max(ci.minLod, max_lod + 0.25f)), ci.anisotropyEnable = VK_FALSE;
+    }
     VkSamplerCustomBorderColorCreateInfoEXT bc{VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     const bool black = !p.border[0] && !p.border[1] && !p.border[2];
     const bool white = p.border[0] == 1.0f && p.border[1] == 1.0f && p.border[2] == 1.0f;
@@ -1873,9 +1878,26 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     const uint64_t cap = getenv("RX_VK_BARE_READ_MB") ? (uint64_t)atoll(getenv("RX_VK_BARE_READ_MB")) << 20 : reach;
                     return std::max<uint64_t>(1ull << 20, std::min(cap, reach - std::min<uint64_t>(reach, 64ull << 10)));
                 }();
+                // ((local, experiment) RX_VK_BARE_WRITE_MB=<MB>: written ones bound that far too (default 1); RX_VK_LOG_BARE=1:
+                // the written ones the 1 MB cut short, by program, 40 lines)
+                static const uint64_t bare_write = [] {
+                    const uint64_t mb = getenv("RX_VK_BARE_WRITE_MB") ? (uint64_t)std::max(1LL, atoll(getenv("RX_VK_BARE_WRITE_MB"))) : 1;
+                    return std::min<uint64_t>(mb << 20, std::min<uint64_t>(dev.props.limits.maxStorageBufferRange, 1ull << 30));
+                }();
                 if (d.count > 1 && !size && addr && !(addr & 3) && host->gpu_guest(addr))
-                    if (const uint64_t end = gpu_pool_end(addr); end > addr)
-                        size = std::min<uint64_t>(end - addr, d.is_written ? (1ull << 20) : bare_read) & ~3ull, bare = true;
+                    if (const uint64_t end = gpu_pool_end(addr); end > addr) {
+                        size = std::min<uint64_t>(end - addr, d.is_written ? bare_write : bare_read) & ~3ull, bare = true;
+                        static const bool log_bare = getenv("RX_VK_LOG_BARE") != nullptr;
+                        if (log_bare && d.is_written && end - addr > size) {
+                            static std::mutex bm;
+                            static std::unordered_set<uint64_t> seen;
+                            std::lock_guard g(bm);
+                            if (seen.size() < 40 && seen.insert(p.key ^ (uint64_t)d.cbuf_offset << 48).second)
+                                logf("vk: bare written pointer cut: prog %016llx c%u+%#x addr %#llx bound %llu KB of %llu KB to its pool's end",
+                                     (unsigned long long)p.key, d.cbuf_index, d.cbuf_offset, (unsigned long long)addr,
+                                     (unsigned long long)(size >> 10), (unsigned long long)((end - addr) >> 10));
+                        }
+                    }
                 // (EvilOOT) the pointer table's regions (c0+0x880, vk_bank.cpp pointer_table) are guesses too: GPU-only, as above
                 if (d.cbuf_index == 0 && d.cbuf_offset == 0x880 && d.count == 3) bare = true;
                 // (Fritchii's storage buffer pass, Info::native_global_bounds) a program whose accesses pick among candidate
@@ -2103,7 +2125,9 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // the translation falls back to the first constant word on its path, c0[0x520], the light buffer's address.
                 // Its low bits named an unrelated texture that changed with the double-buffered buffer: the water flickered
                 // every other frame. No texture there now. RX_VK_HANDLE_POINTER=1: the old handle
-                const uint32_t handle = handle_is_storage_pointer(info, d, k) ? 0u : handle_of(s, st, d, k);
+                // ((local) fragment stages only, the water's: in other stages (the foliage culling's) the textures went missing and all the
+                // foliage was culled while Link swung his sword)
+                const uint32_t handle = (st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT && handle_is_storage_pointer(info, d, k)) ? 0u : handle_of(s, st, d, k);
                 Texture* tex = nullptr;
                 VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex)
                                           : VK_NULL_HANDLE;
@@ -5845,13 +5869,17 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         }
         // (only the dispatch that started the build waits: later ones while it still compiles are left out at once, not 50 ms
         // each, which stalled every frame by 50 ms per compute program still building)
+        // ((local) RX_VK_COMPUTE_WAIT_MS=<ms>: every dispatch waits up to that long for its pipeline, not only the one that started
+        // the build (a test: the foliage culling's dispatches left out while their variants compiled hid the plants on sword swings))
+        static const int wait_ms = getenv("RX_VK_COMPUTE_WAIT_MS") ? std::max(0, atoi(getenv("RX_VK_COMPUTE_WAIT_MS"))) : -1;
         const auto t0 = std::chrono::steady_clock::now();
-        while (fresh && p.compute_state.load(std::memory_order_acquire) != 2 &&
-               std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50))
+        while ((fresh || wait_ms > 0) && p.compute_state.load(std::memory_order_acquire) != 2 &&
+               std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(wait_ms > 0 ? wait_ms : 50))
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         if (p.compute_state.load(std::memory_order_acquire) != 2) {
             static std::atomic<int> told{0};
-            if (told++ < 40) logf("vk: dispatch of %016llx left out: its compute pipeline is still compiling", (unsigned long long)p.key);
+            static const int told_max = wait_ms >= 0 ? 400 : 40;
+            if (told++ < told_max) logf("vk: dispatch of %016llx left out: its compute pipeline is still compiling (frame %llu)", (unsigned long long)p.key, (unsigned long long)texture_frame_no());
             st_pending_skips++;
             return;
         }
